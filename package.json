@@ -1,11 +1,14 @@
 {
   "name": "novent-server",
   "version": "1.0.0",
+  "description": "NOVENT WhatsApp Cloud Telemetry & Auto-Reply Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
   }
 }
