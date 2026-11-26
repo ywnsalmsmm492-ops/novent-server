@@ -1,14 +1,20 @@
 {
   "name": "novent-server",
-  "version": "1.0.0",
-  "description": "NOVENT WhatsApp Cloud Telemetry & Auto-Reply Server",
+  "version": "2.0.0",
+  "description": "NOVENT — Anti-Delete WhatsApp Monitor",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
-    "pino": "^9.5.0",
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pino": "^9.4.0",
     "qrcode": "^1.5.4"
   }
 }
