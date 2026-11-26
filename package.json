@@ -1,7 +1,7 @@
 {
   "name": "novent-server",
-  "version": "2.2.0",
-  "description": "NOVENT — Anti-Delete WhatsApp Monitor",
+  "version": "3.0.0",
+  "description": "NOVENT SaaS Platform",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,9 +12,12 @@
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@whiskeysockets/baileys": "^6.7.18",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "jimp": "^1.6.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.4.1",
     "pino": "^9.4.0",
     "qrcode": "^1.5.4",
     "sharp": "^0.33.4"
