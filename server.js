@@ -1,5 +1,5 @@
 // ============================================================
-// NOVENT Server — Anti-Delete WhatsApp Monitor (Full Fixed)
+// NOVENT Server — Anti-Delete WhatsApp Monitor (V3 Ultimate)
 // ============================================================
 
 const express = require('express');
@@ -121,7 +121,6 @@ async function connectToWhatsApp() {
         latestQR = qr;
         connectionStatus = 'awaiting_scan';
         linkedPhone = null;
-        console.log('📱 QR code available');
       }
 
       if (connection === 'open') {
@@ -151,12 +150,66 @@ async function connectToWhatsApp() {
       }
     });
 
+    // ============================================================
+    // استقبال الرسائل والتعديلات
+    // ============================================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
-        if (!msg.message || msg.message.protocolMessage) continue;
+        if (!msg.message) continue;
+
+        // 🔥 1. فحص التعديلات (يتم فحصها هنا لأن واتساب يرسلها كرسالة جديدة معدلة)
+        let newText = null;
+        if (msg.message.editedMessage) {
+          newText = extractText(msg.message.editedMessage.message);
+        } else if (msg.message.protocolMessage?.editedMessage) {
+          newText = extractText(msg.message.protocolMessage.editedMessage.message);
+        } else if (msg.message.protocolMessage?.type === 14) { // 14 هو رقم تعديل الرسالة في واتساب
+          newText = extractText(msg.message.protocolMessage.editedMessage?.message);
+        }
+
+        if (newText) {
+          const { remoteJid, id } = msg.key;
+          const stored = messageStore.get(storeKey(remoteJid, id));
+          
+          if (stored && !stored.isEditReplied) {
+            const senderName = stored.senderName || msg.pushName || 'غير معروف';
+            const senderPhone = stored.senderPhone || '';
+            const senderJid = stored.senderJid;
+            const oldText = stored.text || '(غير متوفر)';
+
+            addAlert({
+              id: `${id}_edit_${Date.now()}`,
+              type: 'EDITED',
+              sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
+              messageText: `من: ${oldText}\nإلى: ${newText}`,
+              timeText: formatTime(new Date()),
+              remoteJid,
+              timestamp: Date.now(),
+            });
+
+            console.log(`✏️ Edited by ${senderName}: "${oldText}" -> "${newText}"`);
+
+            if (canReply(remoteJid)) {
+              try {
+                await sock.sendMessage(remoteJid, {
+                  text: `✏️ *تنبيه NOVENT*\n\nتم تعديل رسالة من: *${senderName}*\n\n📝 *قبل:* ${oldText}\n📝 *بعد:* ${newText}`,
+                  mentions: senderJid ? [senderJid] : [],
+                });
+              } catch (e) { }
+            }
+
+            stored.text = newText;
+            stored.isEditReplied = true;
+            messageStore.set(storeKey(remoteJid, id), stored);
+          }
+          continue; 
+        }
+
+        // 🔥 2. استقبال رسالة جديدة
+        if (msg.message.protocolMessage) continue; // تجاهل رسائل النظام
 
         const text = extractText(msg.message);
         const isImage = !!msg.message.imageMessage;
@@ -179,7 +232,6 @@ async function connectToWhatsApp() {
               { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
             );
             
-            // استخراج الامتداد الصحيح بناءً على نوع الملف
             const mime = msg.message.imageMessage?.mimetype || msg.message.videoMessage?.mimetype || msg.message.audioMessage?.mimetype || 'application/octet-stream';
             let ext = '.bin';
             if (mime.includes('jpeg')) ext = '.jpg';
@@ -203,6 +255,7 @@ async function connectToWhatsApp() {
         messageStore.set(storeKey(remoteJid, msg.key.id), {
           text: text || (isImage ? 'صورة' : isVideo ? 'فيديو' : isAudio ? 'تسجيل صوتي' : 'ملف'),
           mediaType, mediaPath, senderJid: jid, senderPhone: phone, senderName: name, isGroup, remoteJid, timestamp,
+          isEditReplied: false
         });
 
         if (messageStore.size > MAX_MESSAGE_STORE) {
@@ -214,6 +267,9 @@ async function connectToWhatsApp() {
       }
     });
 
+    // ============================================================
+    // كشف الحذف فقط (REVOKE)
+    // ============================================================
     sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         const { key, update: upd } = update;
@@ -222,7 +278,6 @@ async function connectToWhatsApp() {
         const { remoteJid, id } = key;
         const stored = messageStore.get(storeKey(remoteJid, id));
 
-        // ----- حالة الحذف -----
         const isRevoke =
           upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE ||
           (upd.message?.protocolMessage && upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
@@ -256,50 +311,11 @@ async function connectToWhatsApp() {
               } else {
                 await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
               }
-            } catch (e) {
-              console.error('❌ Reply failed:', e.message);
-            }
+            } catch (e) { }
           }
 
           if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) fs.unlinkSync(stored.mediaPath);
           messageStore.delete(storeKey(remoteJid, id));
-        }
-
-        // ----- حالة التعديل -----
-        let editedMessageObj = null;
-        if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
-          editedMessageObj = upd.message.protocolMessage.editedMessage;
-        } else if (upd.message?.editedMessage) {
-          editedMessageObj = upd.message.editedMessage;
-        } else if (upd.message?.protocolMessage?.editedMessage) {
-          editedMessageObj = upd.message.protocolMessage.editedMessage;
-        }
-
-        if (editedMessageObj) {
-          const newText = extractText(editedMessageObj.message) || extractText(editedMessageObj) || '(نص معدل غير معروف)';
-          const senderName = stored?.senderName || 'غير معروف';
-          const senderPhone = stored?.senderPhone || '';
-          const senderJid = stored?.senderJid;
-          const oldText = stored?.text || '(النص الأصلي غير متوفر)';
-
-          addAlert({
-            id: `${id}_edit_${Date.now()}`, type: 'EDITED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
-            messageText: `من: ${oldText}\nإلى: ${newText}`, timeText: formatTime(new Date()), remoteJid, timestamp: Date.now(),
-          });
-
-          if (canReply(remoteJid)) {
-            try {
-              await sock.sendMessage(remoteJid, {
-                text: `✏️ *تنبيه NOVENT*\n\nتم تعديل رسالة من: *${senderName}*\n\n📝 *قبل:* ${oldText}\n📝 *بعد:* ${newText}`,
-                mentions: senderJid ? [senderJid] : [],
-              });
-            } catch (e) { }
-          }
-
-          if (stored) {
-            stored.text = newText;
-            messageStore.set(storeKey(remoteJid, id), stored);
-          }
         }
       }
     });
@@ -311,7 +327,7 @@ async function connectToWhatsApp() {
   }
 }
 
-// مسار جديد لتسجيل الخروج من التطبيق
+// مسار تسجيل الخروج
 app.post('/api/logout', async (req, res) => {
   try {
     if (sock && connectionStatus === 'connected') {
@@ -329,10 +345,10 @@ app.post('/api/logout', async (req, res) => {
 
 app.get('/health', (req, res) => res.status(200).json({ ok: true, status: connectionStatus }));
 app.get('/qr', async (req, res) => {
-  if (connectionStatus === 'connected') return res.send(`<html dir="rtl"><body><h2 style="color:green">✅ متصل</h2></body></html>`);
-  if (!latestQR) return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body><h2>⏳ جاري التهيئة...</h2></body></html>`);
+  if (connectionStatus === 'connected') return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px"><h2 style="color:green">✅ متصل</h2></body></html>`);
+  if (!latestQR) return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body style="text-align:center;padding:40px"><h2>⏳ جاري التهيئة...</h2></body></html>`);
   const qrImage = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
-  res.send(`<html dir="rtl"><body style="text-align:center"><h2>امسح الرمز</h2><img src="${qrImage}" /><script>setTimeout(()=>location.reload(),15000)</script></body></html>`);
+  res.send(`<html dir="rtl"><body style="text-align:center;padding:20px"><h2>امسح الرمز</h2><img src="${qrImage}" /><script>setTimeout(()=>location.reload(),15000)</script></body></html>`);
 });
 
 app.get('/api/dashboard', (req, res) => {
@@ -346,5 +362,6 @@ app.get('/api/dashboard', (req, res) => {
 });
 
 app.listen(PORT, () => {
+  console.log(`🚀 NOVENT server listening on port ${PORT}`);
   connectToWhatsApp().catch(console.error);
 });
