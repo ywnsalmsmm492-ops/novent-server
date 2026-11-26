@@ -1,5 +1,5 @@
 // ============================================================
-// NOVENT Server — Anti-Delete WhatsApp Monitor (Text + Image + Video + Audio)
+// NOVENT Server — Anti-Delete WhatsApp Monitor (Full Support)
 // ============================================================
 
 const express = require('express');
@@ -162,7 +162,7 @@ async function connectToWhatsApp() {
       }
     });
 
-    // ---------- حفظ الرسائل والوسائط (صور/فيديو/صوت) ----------
+    // ---------- حفظ الرسائل والوسائط ----------
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -173,16 +173,18 @@ async function connectToWhatsApp() {
         const text = extractText(msg.message);
         const isImage = !!msg.message.imageMessage;
         const isVideo = !!msg.message.videoMessage;
-        const isAudio = !!msg.message.audioMessage; // دعم الصوتيات
+        const isAudio = !!msg.message.audioMessage;
+        const isDocument = !!msg.message.documentMessage;
+        const isSticker = !!msg.message.stickerMessage;
 
-        if (!text && !isImage && !isVideo && !isAudio) continue;
+        if (!text && !isImage && !isVideo && !isAudio && !isDocument && !isSticker) continue;
 
         const { jid, phone, name, isGroup, remoteJid } = getSenderInfo(msg);
         const timestamp = (msg.messageTimestamp || Date.now() / 1000) * 1000;
         let mediaPath = null;
+        let mediaType = '';
 
-        // تحميل الوسائط وحفظها على القرص
-        if (isImage || isVideo || isAudio) {
+        if (isImage || isVideo || isAudio || isDocument || isSticker) {
           try {
             const buffer = await downloadMediaMessage(
               msg,
@@ -190,19 +192,24 @@ async function connectToWhatsApp() {
               {},
               { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
             );
-            const ext = isImage ? '.jpg' : isVideo ? '.mp4' : '.ogg';
-            mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`);
-            fs.writeFileSync(mediaPath, buffer);
+            
+            if (isImage) { mediaType = 'image'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.jpg`); }
+            else if (isVideo) { mediaType = 'video'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.mp4`); }
+            else if (isAudio) { mediaType = 'audio'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.ogg`); }
+            else if (isDocument) { mediaType = 'document'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.pdf`); }
+            else if (isSticker) { mediaType = 'sticker'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.webp`); }
+
+            if (mediaPath) {
+              fs.writeFileSync(mediaPath, buffer);
+            }
           } catch (err) {
             console.error('❌ Failed to download media:', err.message);
           }
         }
 
         messageStore.set(storeKey(remoteJid, msg.key.id), {
-          text: text || (isImage ? 'صورة' : isVideo ? 'فيديو' : 'تسجيل صوتي'),
-          isImage,
-          isVideo,
-          isAudio,
+          text: text || (isImage ? 'صورة' : isVideo ? 'فيديو' : isAudio ? 'تسجيل صوتي' : 'ملف'),
+          mediaType,
           mediaPath,
           senderJid: jid,
           senderPhone: phone,
@@ -254,61 +261,36 @@ async function connectToWhatsApp() {
             timestamp: Date.now(),
           });
 
-          console.log(`🗑️ Deleted by ${senderName}: "${originalText}"`);
-
           if (canReply(remoteJid)) {
             try {
               const replyText = `🗑️ *تنبيه NOVENT*\n\n` +
                                 `تم حذف رسالة من: *${senderName}*\n` +
-                                `📝 النص الأصلي:\n${originalText}`;
+                                `📝 المحتوى:\n${originalText}`;
 
-              // 1. إذا كانت صورة
-              if (stored?.isImage && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
-                await sock.sendMessage(remoteJid, {
-                  image: { url: stored.mediaPath },
-                  caption: replyText,
-                  mentions: senderJid ? [senderJid] : [],
-                });
-              } 
-              // 2. إذا كانت فيديو
-              else if (stored?.isVideo && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
-                await sock.sendMessage(remoteJid, {
-                  video: { url: stored.mediaPath },
-                  caption: replyText,
-                  mentions: senderJid ? [senderJid] : [],
-                });
-              }
-              // 3. إذا كانت رسالة صوتية (نرسل النص أولاً ثم الصوت)
-              else if (stored?.isAudio && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
-                await sock.sendMessage(remoteJid, {
-                  text: replyText,
-                  mentions: senderJid ? [senderJid] : [],
-                });
-                await sock.sendMessage(remoteJid, {
-                  audio: { url: stored.mediaPath },
-                  mimetype: 'audio/ogg; codecs=opus',
-                  ptt: true,
-                });
-              } 
-              // 4. إذا كانت نصية
-              else {
-                await sock.sendMessage(remoteJid, {
-                  text: replyText,
-                  mentions: senderJid ? [senderJid] : [],
-                });
+              if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
+                if (stored.mediaType === 'image') {
+                  await sock.sendMessage(remoteJid, { image: { url: stored.mediaPath }, caption: replyText, mentions: senderJid ? [senderJid] : [] });
+                } else if (stored.mediaType === 'video') {
+                  await sock.sendMessage(remoteJid, { video: { url: stored.mediaPath }, caption: replyText, mentions: senderJid ? [senderJid] : [] });
+                } else if (stored.mediaType === 'audio') {
+                  await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
+                  await sock.sendMessage(remoteJid, { audio: { url: stored.mediaPath }, mimetype: 'audio/ogg; codecs=opus', ptt: true });
+                } else {
+                  await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
+                }
+              } else {
+                await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
               }
             } catch (e) {
               console.error('❌ Reply failed:', e.message);
             }
           }
 
-          if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
-            fs.unlinkSync(stored.mediaPath);
-          }
+          if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) fs.unlinkSync(stored.mediaPath);
           messageStore.delete(storeKey(remoteJid, id));
         }
 
-        // ----- 2. حالة التعديل (محدثة) -----
+        // ----- 2. حالة التعديل (مع الرد الآن) -----
         let editedMessageObj = null;
         if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
           editedMessageObj = upd.message.protocolMessage.editedMessage;
@@ -322,6 +304,7 @@ async function connectToWhatsApp() {
           const newText = extractText(editedMessageObj.message) || extractText(editedMessageObj) || '(نص معدل غير معروف)';
           const senderName = stored?.senderName || 'غير معروف';
           const senderPhone = stored?.senderPhone || '';
+          const senderJid = stored?.senderJid;
           const oldText = stored?.text || '(النص الأصلي غير متوفر)';
 
           addAlert({
@@ -334,7 +317,20 @@ async function connectToWhatsApp() {
             timestamp: Date.now(),
           });
 
-          console.log(`✏️ Edited by ${senderName}: "${oldText}" → "${newText}"`);
+          // ✅ إرسال رد تلقائي على التعديل (تمت إضافته بناءً على طلبك)
+          if (canReply(remoteJid)) {
+            try {
+              await sock.sendMessage(remoteJid, {
+                text: `✏️ *تنبيه NOVENT*\n\n` +
+                      `تم تعديل رسالة من: *${senderName}*\n\n` +
+                      `📝 *قبل:* ${oldText}\n` +
+                      `📝 *بعد:* ${newText}`,
+                mentions: senderJid ? [senderJid] : [],
+              });
+            } catch (e) {
+              console.error('❌ Edit reply failed:', e.message);
+            }
+          }
 
           if (stored) {
             stored.text = newText;
