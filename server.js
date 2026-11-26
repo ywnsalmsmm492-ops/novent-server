@@ -1,17 +1,20 @@
 // ============================================================
-// NOVENT Server — Anti-Delete WhatsApp Monitor
+// NOVENT Server — Anti-Delete WhatsApp Monitor (Text + Image + Video + Audio)
 // ============================================================
 
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
   proto,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
@@ -22,21 +25,26 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(path.dirname(AUTH_DIR), 'novent_media');
+
+if (!fs.existsSync(MEDIA_DIR)) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+}
 
 // ---------- الحالة العامة ----------
 let sock = null;
 let latestQR = null;
-let connectionStatus = 'disconnected'; // disconnected | awaiting_scan | connected | needs_reauth
+let connectionStatus = 'disconnected'; 
 let linkedPhone = null;
 let reconnectAttempts = 0;
 let isConnecting = false;
 
-const messageStore = new Map();     // key: `${remoteJid}:${id}` -> رسالة واردة
-const alerts = [];                  // آخر التنبيهات
-const replyCooldown = new Map();    // منع تكرار الردود
+const messageStore = new Map();     
+const alerts = [];                  
+const replyCooldown = new Map();    
 const MAX_ALERTS = 200;
-const MAX_MESSAGE_STORE = 5000;     // حد أقصى لعدد الرسائل المحفوظة
-const REPLY_COOLDOWN_MS = 8000;     // 8 ثوانٍ بين كل ردين في نفس المحادثة
+const MAX_MESSAGE_STORE = 5000;     
+const REPLY_COOLDOWN_MS = 8000;     
 
 // ============================================================
 // أدوات مساعدة
@@ -113,10 +121,8 @@ async function connectToWhatsApp() {
       syncFullHistory: false,
     });
 
-    // حفظ الاعتمادات فور أي تغيير (ضروري لاستمرارية الجلسة)
     sock.ev.on('creds.update', saveCreds);
 
-    // ---------- تحديث حالة الاتصال ----------
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -156,24 +162,48 @@ async function connectToWhatsApp() {
       }
     });
 
-    // ---------- حفظ كل رسالة واردة جديدة ----------
-    sock.ev.on('messages.upsert', ({ messages, type }) => {
+    // ---------- حفظ الرسائل والوسائط (صور/فيديو/صوت) ----------
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        // 🔒 منع الحلقات: لا نعالج رسائل البوت نفسه
         if (msg.key.fromMe) continue;
-        // تجاهل الرسائل الفارغة أو رسائل البروتوكول
         if (!msg.message || msg.message.protocolMessage) continue;
 
         const text = extractText(msg.message);
-        if (!text) continue;
+        const isImage = !!msg.message.imageMessage;
+        const isVideo = !!msg.message.videoMessage;
+        const isAudio = !!msg.message.audioMessage; // دعم الصوتيات
+
+        if (!text && !isImage && !isVideo && !isAudio) continue;
 
         const { jid, phone, name, isGroup, remoteJid } = getSenderInfo(msg);
         const timestamp = (msg.messageTimestamp || Date.now() / 1000) * 1000;
+        let mediaPath = null;
+
+        // تحميل الوسائط وحفظها على القرص
+        if (isImage || isVideo || isAudio) {
+          try {
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+            );
+            const ext = isImage ? '.jpg' : isVideo ? '.mp4' : '.ogg';
+            mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`);
+            fs.writeFileSync(mediaPath, buffer);
+          } catch (err) {
+            console.error('❌ Failed to download media:', err.message);
+          }
+        }
 
         messageStore.set(storeKey(remoteJid, msg.key.id), {
-          text,
+          text: text || (isImage ? 'صورة' : isVideo ? 'فيديو' : 'تسجيل صوتي'),
+          isImage,
+          isVideo,
+          isAudio,
+          mediaPath,
           senderJid: jid,
           senderPhone: phone,
           senderName: name,
@@ -182,9 +212,12 @@ async function connectToWhatsApp() {
           timestamp,
         });
 
-        // حد أقصى: احذف الأقدم عند تجاوز الحد
         if (messageStore.size > MAX_MESSAGE_STORE) {
           const oldestKey = messageStore.keys().next().value;
+          const oldestData = messageStore.get(oldestKey);
+          if (oldestData?.mediaPath && fs.existsSync(oldestData.mediaPath)) {
+            fs.unlinkSync(oldestData.mediaPath);
+          }
           messageStore.delete(oldestKey);
         }
       }
@@ -199,14 +232,14 @@ async function connectToWhatsApp() {
         const { remoteJid, id } = key;
         const stored = messageStore.get(storeKey(remoteJid, id));
 
-        // ----- حالة الحذف -----
+        // ----- 1. حالة الحذف -----
         const isRevoke =
           upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE ||
           (upd.message?.protocolMessage &&
             upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
 
         if (isRevoke) {
-          const originalText = stored?.text || '(النص الأصلي غير متوفر — الرسالة أقدم من الذاكرة)';
+          const originalText = stored?.text || '(النص الأصلي غير متوفر)';
           const senderName = stored?.senderName || 'غير معروف';
           const senderPhone = stored?.senderPhone || '';
           const senderJid = stored?.senderJid;
@@ -223,28 +256,70 @@ async function connectToWhatsApp() {
 
           console.log(`🗑️ Deleted by ${senderName}: "${originalText}"`);
 
-          // إرسال رد تلقائي مع منع التكرار
           if (canReply(remoteJid)) {
             try {
-              await sock.sendMessage(remoteJid, {
-                text:
-                  `🗑️ *تنبيه NOVENT*\n\n` +
-                  `تم حذف رسالة من: *${senderName}*\n` +
-                  `📝 النص الأصلي:\n${originalText}`,
-                mentions: senderJid ? [senderJid] : [],
-              });
+              const replyText = `🗑️ *تنبيه NOVENT*\n\n` +
+                                `تم حذف رسالة من: *${senderName}*\n` +
+                                `📝 النص الأصلي:\n${originalText}`;
+
+              // 1. إذا كانت صورة
+              if (stored?.isImage && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
+                await sock.sendMessage(remoteJid, {
+                  image: { url: stored.mediaPath },
+                  caption: replyText,
+                  mentions: senderJid ? [senderJid] : [],
+                });
+              } 
+              // 2. إذا كانت فيديو
+              else if (stored?.isVideo && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
+                await sock.sendMessage(remoteJid, {
+                  video: { url: stored.mediaPath },
+                  caption: replyText,
+                  mentions: senderJid ? [senderJid] : [],
+                });
+              }
+              // 3. إذا كانت رسالة صوتية (نرسل النص أولاً ثم الصوت)
+              else if (stored?.isAudio && stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
+                await sock.sendMessage(remoteJid, {
+                  text: replyText,
+                  mentions: senderJid ? [senderJid] : [],
+                });
+                await sock.sendMessage(remoteJid, {
+                  audio: { url: stored.mediaPath },
+                  mimetype: 'audio/ogg; codecs=opus',
+                  ptt: true,
+                });
+              } 
+              // 4. إذا كانت نصية
+              else {
+                await sock.sendMessage(remoteJid, {
+                  text: replyText,
+                  mentions: senderJid ? [senderJid] : [],
+                });
+              }
             } catch (e) {
               console.error('❌ Reply failed:', e.message);
             }
           }
 
+          if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
+            fs.unlinkSync(stored.mediaPath);
+          }
           messageStore.delete(storeKey(remoteJid, id));
         }
 
-        // ----- حالة التعديل -----
-        if (upd.message?.editedMessage) {
-          const newText =
-            extractText(upd.message.editedMessage.message) || '(نص معدل غير معروف)';
+        // ----- 2. حالة التعديل (محدثة) -----
+        let editedMessageObj = null;
+        if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+          editedMessageObj = upd.message.protocolMessage.editedMessage;
+        } else if (upd.message?.editedMessage) {
+          editedMessageObj = upd.message.editedMessage;
+        } else if (upd.message?.protocolMessage?.editedMessage) {
+          editedMessageObj = upd.message.protocolMessage.editedMessage;
+        }
+
+        if (editedMessageObj) {
+          const newText = extractText(editedMessageObj.message) || extractText(editedMessageObj) || '(نص معدل غير معروف)';
           const senderName = stored?.senderName || 'غير معروف';
           const senderPhone = stored?.senderPhone || '';
           const oldText = stored?.text || '(النص الأصلي غير متوفر)';
@@ -282,120 +357,50 @@ async function connectToWhatsApp() {
 // المسارات (Routes)
 // ============================================================
 
-// 🔋 Health check — يستخدمه Ping خارجي لإبقاء Render مستيقظًا
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    ok: true,
-    status: connectionStatus,
-    uptime: Math.floor(process.uptime()),
-    alerts: alerts.length,
-  });
+  res.status(200).json({ ok: true, status: connectionStatus, uptime: Math.floor(process.uptime()) });
 });
 
-// 📱 صفحة QR
 app.get('/qr', async (req, res) => {
   try {
     if (connectionStatus === 'connected') {
-      return res.send(`
-        <!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f5f7fa}</style>
-        </head><body>
-          <h2 style="color:#0a7a6a">✅ واتساب متصل بالفعل</h2>
-          <p>${linkedPhone ? 'الرقم المرتبط: <b>' + linkedPhone + '</b>' : ''}</p>
-          <p style="color:#888;font-size:13px;margin-top:30px">لا حاجة لمسح رمز جديد.</p>
-        </body></html>
-      `);
+      return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px;font-family:sans-serif"><h2 style="color:green">✅ واتساب متصل بالفعل</h2><p>${linkedPhone ? 'الرقم: '+linkedPhone : ''}</p></body></html>`);
     }
-
     if (connectionStatus === 'needs_reauth') {
-      return res.send(`
-        <!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f5f7fa}</style>
-        </head><body>
-          <h2 style="color:#c0392b">⚠️ الجلسة انتهت</h2>
-          <p>افتح واتساب على هاتفك وامسح رمز QR جديدًا بعد إعادة تشغيل السيرفر.</p>
-          <a href="/qr" style="display:inline-block;margin-top:20px;padding:10px 20px;background:#0a3a5a;color:#fff;border-radius:8px;text-decoration:none">تحديث</a>
-        </body></html>
-      `);
+      return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px;font-family:sans-serif"><h2 style="color:red">⚠️ الجلسة انتهت</h2><p>أعد تشغيل السيرفر وامسح رمز QR جديد.</p><a href="/qr">تحديث</a></body></html>`);
     }
-
     if (!latestQR) {
-      return res.send(`
-        <!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <meta http-equiv="refresh" content="3">
-        <style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f5f7fa}</style>
-        </head><body>
-          <h2>⏳ جاري تهيئة جلسة واتساب...</h2>
-          <p>سيظهر رمز QR هنا تلقائيًا خلال ثوانٍ.</p>
-        </body></html>
-      `);
+      return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body style="text-align:center;padding:40px;font-family:sans-serif"><h2>⏳ جاري تهيئة الجلسة...</h2></body></html>`);
     }
-
     const qrImage = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
     res.send(`
-      <!DOCTYPE html>
       <html dir="rtl">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>NOVENT | ربط واتساب</title>
-      </head>
+      <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
       <body style="font-family:sans-serif;text-align:center;padding:20px;background:#f5f7fa;margin:0">
         <h2 style="color:#0a3a5a;margin-top:10px">امسح الرمز من واتساب</h2>
-        <p style="color:#555;margin:6px 0 20px">واتساب ← الإعدادات ← الأجهزة المرتبطة ← ربط جهاز</p>
-        <img src="${qrImage}" alt="QR"
-             style="border:8px solid #fff;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.18);max-width:90%" />
-        <p style="color:#999;font-size:12px;margin-top:24px">تحديث تلقائي كل 15 ثانية</p>
+        <img src="${qrImage}" style="border:8px solid #fff;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.18);max-width:90%" />
         <script>setTimeout(() => location.reload(), 15000);</script>
       </body>
       </html>
     `);
   } catch (e) {
-    console.error('QR generation error:', e);
     res.status(500).send('خطأ في توليد رمز QR');
   }
 });
 
-// 📊 لوحة المعلومات للتطبيق
 app.get('/api/dashboard', (req, res) => {
-  const statusMap = {
-    connected: 'متصل',
-    awaiting_scan: 'بانتظار المسح',
-    needs_reauth: 'يحتاج إعادة ربط',
-    disconnected: 'غير متصل',
-  };
-
+  const statusMap = { connected: 'متصل', awaiting_scan: 'بانتظار المسح', needs_reauth: 'يحتاج إعادة ربط', disconnected: 'غير متصل' };
   res.json({
     status: statusMap[connectionStatus] || 'غير متصل',
     connectionStatus,
     linkedPhone,
     deletedCount: alerts.filter((a) => a.type === 'DELETED').length,
     editedCount: alerts.filter((a) => a.type === 'EDITED').length,
-    alerts: alerts.slice(0, 50).map((a) => ({
-      id: a.id,
-      type: a.type,
-      sender: a.sender,
-      messageText: a.messageText,
-      timeText: a.timeText,
-    })),
-    serverTime: new Date().toISOString(),
+    alerts: alerts.slice(0, 50).map((a) => ({ id: a.id, type: a.type, sender: a.sender, messageText: a.messageText, timeText: a.timeText })),
   });
 });
 
-// نقطة جذر بسيطة
-app.get('/', (req, res) => {
-  res.send('NOVENT Server is running. Visit /qr to link WhatsApp.');
-});
-
-// ============================================================
-// التشغيل
-// ============================================================
-
 app.listen(PORT, () => {
   console.log(`🚀 NOVENT server listening on port ${PORT}`);
-  console.log(`📁 Auth directory: ${AUTH_DIR}`);
   connectToWhatsApp().catch(console.error);
 });
