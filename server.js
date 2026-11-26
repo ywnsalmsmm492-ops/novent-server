@@ -1,5 +1,5 @@
 // ============================================================
-// NOVENT Server — Anti-Delete WhatsApp Monitor (Full Support)
+// NOVENT Server — Anti-Delete WhatsApp Monitor (Full Fixed)
 // ============================================================
 
 const express = require('express');
@@ -31,7 +31,6 @@ if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
 }
 
-// ---------- الحالة العامة ----------
 let sock = null;
 let latestQR = null;
 let connectionStatus = 'disconnected'; 
@@ -45,10 +44,6 @@ const replyCooldown = new Map();
 const MAX_ALERTS = 200;
 const MAX_MESSAGE_STORE = 5000;     
 const REPLY_COOLDOWN_MS = 8000;     
-
-// ============================================================
-// أدوات مساعدة
-// ============================================================
 
 function storeKey(remoteJid, id) {
   return `${remoteJid}:${id}`;
@@ -96,10 +91,6 @@ function formatTime(date) {
   });
 }
 
-// ============================================================
-// الاتصال بواتساب
-// ============================================================
-
 async function connectToWhatsApp() {
   if (isConnecting) return;
   isConnecting = true;
@@ -130,7 +121,7 @@ async function connectToWhatsApp() {
         latestQR = qr;
         connectionStatus = 'awaiting_scan';
         linkedPhone = null;
-        console.log('📱 QR code available — awaiting scan');
+        console.log('📱 QR code available');
       }
 
       if (connection === 'open') {
@@ -149,11 +140,9 @@ async function connectToWhatsApp() {
         if (statusCode === DisconnectReason.loggedOut) {
           connectionStatus = 'needs_reauth';
           isConnecting = false;
-          console.log('❌ Session revoked — new QR required');
         } else {
           connectionStatus = 'disconnected';
           const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts++), 60000);
-          console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s...`);
           setTimeout(() => {
             isConnecting = false;
             connectToWhatsApp().catch(console.error);
@@ -162,7 +151,6 @@ async function connectToWhatsApp() {
       }
     });
 
-    // ---------- حفظ الرسائل والوسائط ----------
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -187,21 +175,26 @@ async function connectToWhatsApp() {
         if (isImage || isVideo || isAudio || isDocument || isSticker) {
           try {
             const buffer = await downloadMediaMessage(
-              msg,
-              'buffer',
-              {},
+              msg, 'buffer', {},
               { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
             );
             
-            if (isImage) { mediaType = 'image'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.jpg`); }
-            else if (isVideo) { mediaType = 'video'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.mp4`); }
-            else if (isAudio) { mediaType = 'audio'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.ogg`); }
-            else if (isDocument) { mediaType = 'document'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.pdf`); }
-            else if (isSticker) { mediaType = 'sticker'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}.webp`); }
+            // استخراج الامتداد الصحيح بناءً على نوع الملف
+            const mime = msg.message.imageMessage?.mimetype || msg.message.videoMessage?.mimetype || msg.message.audioMessage?.mimetype || 'application/octet-stream';
+            let ext = '.bin';
+            if (mime.includes('jpeg')) ext = '.jpg';
+            else if (mime.includes('png')) ext = '.png';
+            else if (mime.includes('mp4')) ext = '.mp4';
+            else if (mime.includes('ogg')) ext = '.ogg';
+            else if (mime.includes('webp')) ext = '.webp';
 
-            if (mediaPath) {
-              fs.writeFileSync(mediaPath, buffer);
-            }
+            if (isImage) { mediaType = 'image'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`); }
+            else if (isVideo) { mediaType = 'video'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`); }
+            else if (isAudio) { mediaType = 'audio'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`); }
+            else if (isDocument) { mediaType = 'document'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`); }
+            else if (isSticker) { mediaType = 'sticker'; mediaPath = path.join(MEDIA_DIR, `${msg.key.id}${ext}`); }
+
+            if (mediaPath) fs.writeFileSync(mediaPath, buffer);
           } catch (err) {
             console.error('❌ Failed to download media:', err.message);
           }
@@ -209,28 +202,18 @@ async function connectToWhatsApp() {
 
         messageStore.set(storeKey(remoteJid, msg.key.id), {
           text: text || (isImage ? 'صورة' : isVideo ? 'فيديو' : isAudio ? 'تسجيل صوتي' : 'ملف'),
-          mediaType,
-          mediaPath,
-          senderJid: jid,
-          senderPhone: phone,
-          senderName: name,
-          isGroup,
-          remoteJid,
-          timestamp,
+          mediaType, mediaPath, senderJid: jid, senderPhone: phone, senderName: name, isGroup, remoteJid, timestamp,
         });
 
         if (messageStore.size > MAX_MESSAGE_STORE) {
           const oldestKey = messageStore.keys().next().value;
           const oldestData = messageStore.get(oldestKey);
-          if (oldestData?.mediaPath && fs.existsSync(oldestData.mediaPath)) {
-            fs.unlinkSync(oldestData.mediaPath);
-          }
+          if (oldestData?.mediaPath && fs.existsSync(oldestData.mediaPath)) fs.unlinkSync(oldestData.mediaPath);
           messageStore.delete(oldestKey);
         }
       }
     });
 
-    // ---------- كشف الحذف (REVOKE) والتعديل (EDIT) ----------
     sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         const { key, update: upd } = update;
@@ -239,11 +222,10 @@ async function connectToWhatsApp() {
         const { remoteJid, id } = key;
         const stored = messageStore.get(storeKey(remoteJid, id));
 
-        // ----- 1. حالة الحذف -----
+        // ----- حالة الحذف -----
         const isRevoke =
           upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE ||
-          (upd.message?.protocolMessage &&
-            upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
+          (upd.message?.protocolMessage && upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
 
         if (isRevoke) {
           const originalText = stored?.text || '(النص الأصلي غير متوفر)';
@@ -252,20 +234,13 @@ async function connectToWhatsApp() {
           const senderJid = stored?.senderJid;
 
           addAlert({
-            id,
-            type: 'DELETED',
-            sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
-            messageText: originalText,
-            timeText: formatTime(new Date()),
-            remoteJid,
-            timestamp: Date.now(),
+            id, type: 'DELETED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
+            messageText: originalText, timeText: formatTime(new Date()), remoteJid, timestamp: Date.now(),
           });
 
           if (canReply(remoteJid)) {
             try {
-              const replyText = `🗑️ *تنبيه NOVENT*\n\n` +
-                                `تم حذف رسالة من: *${senderName}*\n` +
-                                `📝 المحتوى:\n${originalText}`;
+              const replyText = `🗑️ *تنبيه NOVENT*\n\nتم حذف رسالة من: *${senderName}*\n📝 المحتوى:\n${originalText}`;
 
               if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) {
                 if (stored.mediaType === 'image') {
@@ -290,7 +265,7 @@ async function connectToWhatsApp() {
           messageStore.delete(storeKey(remoteJid, id));
         }
 
-        // ----- 2. حالة التعديل (مع الرد الآن) -----
+        // ----- حالة التعديل -----
         let editedMessageObj = null;
         if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
           editedMessageObj = upd.message.protocolMessage.editedMessage;
@@ -308,28 +283,17 @@ async function connectToWhatsApp() {
           const oldText = stored?.text || '(النص الأصلي غير متوفر)';
 
           addAlert({
-            id: `${id}_edit_${Date.now()}`,
-            type: 'EDITED',
-            sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
-            messageText: `من: ${oldText}\nإلى: ${newText}`,
-            timeText: formatTime(new Date()),
-            remoteJid,
-            timestamp: Date.now(),
+            id: `${id}_edit_${Date.now()}`, type: 'EDITED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`,
+            messageText: `من: ${oldText}\nإلى: ${newText}`, timeText: formatTime(new Date()), remoteJid, timestamp: Date.now(),
           });
 
-          // ✅ إرسال رد تلقائي على التعديل (تمت إضافته بناءً على طلبك)
           if (canReply(remoteJid)) {
             try {
               await sock.sendMessage(remoteJid, {
-                text: `✏️ *تنبيه NOVENT*\n\n` +
-                      `تم تعديل رسالة من: *${senderName}*\n\n` +
-                      `📝 *قبل:* ${oldText}\n` +
-                      `📝 *بعد:* ${newText}`,
+                text: `✏️ *تنبيه NOVENT*\n\nتم تعديل رسالة من: *${senderName}*\n\n📝 *قبل:* ${oldText}\n📝 *بعد:* ${newText}`,
                 mentions: senderJid ? [senderJid] : [],
               });
-            } catch (e) {
-              console.error('❌ Edit reply failed:', e.message);
-            }
+            } catch (e) { }
           }
 
           if (stored) {
@@ -343,60 +307,44 @@ async function connectToWhatsApp() {
     isConnecting = false;
   } catch (err) {
     isConnecting = false;
-    console.error('❌ connectToWhatsApp error:', err);
-    const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts++), 60000);
-    setTimeout(() => connectToWhatsApp().catch(console.error), delay);
+    setTimeout(() => connectToWhatsApp().catch(console.error), 5000);
   }
 }
 
-// ============================================================
-// المسارات (Routes)
-// ============================================================
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ ok: true, status: connectionStatus, uptime: Math.floor(process.uptime()) });
-});
-
-app.get('/qr', async (req, res) => {
+// مسار جديد لتسجيل الخروج من التطبيق
+app.post('/api/logout', async (req, res) => {
   try {
-    if (connectionStatus === 'connected') {
-      return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px;font-family:sans-serif"><h2 style="color:green">✅ واتساب متصل بالفعل</h2><p>${linkedPhone ? 'الرقم: '+linkedPhone : ''}</p></body></html>`);
+    if (sock && connectionStatus === 'connected') {
+      await sock.logout();
+      connectionStatus = 'disconnected';
+      linkedPhone = null;
+      res.json({ success: true, message: 'تم فصل الجهاز بنجاح' });
+    } else {
+      res.json({ success: false, message: 'الجهاز غير متصل بالفعل' });
     }
-    if (connectionStatus === 'needs_reauth') {
-      return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px;font-family:sans-serif"><h2 style="color:red">⚠️ الجلسة انتهت</h2><p>أعد تشغيل السيرفر وامسح رمز QR جديد.</p><a href="/qr">تحديث</a></body></html>`);
-    }
-    if (!latestQR) {
-      return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body style="text-align:center;padding:40px;font-family:sans-serif"><h2>⏳ جاري تهيئة الجلسة...</h2></body></html>`);
-    }
-    const qrImage = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
-    res.send(`
-      <html dir="rtl">
-      <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-      <body style="font-family:sans-serif;text-align:center;padding:20px;background:#f5f7fa;margin:0">
-        <h2 style="color:#0a3a5a;margin-top:10px">امسح الرمز من واتساب</h2>
-        <img src="${qrImage}" style="border:8px solid #fff;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.18);max-width:90%" />
-        <script>setTimeout(() => location.reload(), 15000);</script>
-      </body>
-      </html>
-    `);
   } catch (e) {
-    res.status(500).send('خطأ في توليد رمز QR');
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
+app.get('/health', (req, res) => res.status(200).json({ ok: true, status: connectionStatus }));
+app.get('/qr', async (req, res) => {
+  if (connectionStatus === 'connected') return res.send(`<html dir="rtl"><body><h2 style="color:green">✅ متصل</h2></body></html>`);
+  if (!latestQR) return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body><h2>⏳ جاري التهيئة...</h2></body></html>`);
+  const qrImage = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
+  res.send(`<html dir="rtl"><body style="text-align:center"><h2>امسح الرمز</h2><img src="${qrImage}" /><script>setTimeout(()=>location.reload(),15000)</script></body></html>`);
+});
+
 app.get('/api/dashboard', (req, res) => {
-  const statusMap = { connected: 'متصل', awaiting_scan: 'بانتظار المسح', needs_reauth: 'يحتاج إعادة ربط', disconnected: 'غير متصل' };
   res.json({
-    status: statusMap[connectionStatus] || 'غير متصل',
-    connectionStatus,
-    linkedPhone,
+    status: connectionStatus === 'connected' ? 'متصل' : 'غير متصل',
+    connectionStatus, linkedPhone,
     deletedCount: alerts.filter((a) => a.type === 'DELETED').length,
     editedCount: alerts.filter((a) => a.type === 'EDITED').length,
-    alerts: alerts.slice(0, 50).map((a) => ({ id: a.id, type: a.type, sender: a.sender, messageText: a.messageText, timeText: a.timeText })),
+    alerts: alerts.slice(0, 50),
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 NOVENT server listening on port ${PORT}`);
   connectToWhatsApp().catch(console.error);
 });
