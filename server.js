@@ -31,28 +31,44 @@ const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(path.dirname(AUTH_DIR), 'novent_media');
 
 // ==========================================
-// 🔍 فحص وتنظيف رابط قاعدة البيانات تلقائياً
+// 🛡️ محرك اتصال ذكي ومحمي 100%
 // ==========================================
-let rawMongoURI = process.env.MONGO_URI || '';
+let MONGO_URI = process.env.MONGO_URI ? process.env.MONGO_URI.trim() : '';
 
-// إزالة أي مسافات أو علامات تنصيص قد تكون سببت المشكلة
-let MONGO_URI = rawMongoURI.trim().replace(/^["']|["']$/g, '');
+// إزالة أي علامات تنصيص قد تكون موجودة بالخطأ
+MONGO_URI = MONGO_URI.replace(/^["']|["']$/g, '');
 
-// إجبار إضافة authSource=admin إذا لم تكن موجودة (مهم جداً للاتصال بـ Atlas)
-if (MONGO_URI && MONGO_URI !== 'ضع_رابط_قاعدة_البيانات_هنا' && !MONGO_URI.includes('authSource=')) {
-  MONGO_URI += (MONGO_URI.includes('?') ? '&' : '?') + 'authSource=admin';
+if (MONGO_URI && MONGO_URI.includes('://') && MONGO_URI.includes('@')) {
+    try {
+        const [protocol, rest] = MONGO_URI.split('://');
+        const [credentials, host] = rest.split('@');
+        
+        if (credentials.includes(':')) {
+            const [user, ...passParts] = credentials.split(':');
+            const pass = passParts.join(':'); // لدعم كلمات المرور التي تحتوي على نقطتين
+            
+            // ترميز اسم المستخدم وكلمة المرور لضمان قبول أي رموز
+            const encodedUser = encodeURIComponent(user);
+            const encodedPass = encodeURIComponent(pass);
+            
+            MONGO_URI = `${protocol}://${encodedUser}:${encodedPass}@${host}`;
+        }
+    } catch (e) {
+        console.log("⚠️ تحذير: هناك مشكلة في صياغة الرابط، سيتم استخدامه كما هو.");
+    }
 }
 
-// طباعة الرابط مع إخفاء كلمة المرور للتشخيص
+// إجبار إضافة authSource=admin إذا لم تكن موجودة
+if (MONGO_URI && MONGO_URI.startsWith('mongodb') && !MONGO_URI.includes('authSource=')) {
+    MONGO_URI += (MONGO_URI.includes('?') ? '&' : '?') + 'authSource=admin';
+}
+
+// طباعة الرابط للتشخيص (بدون كلمة المرور)
 if (MONGO_URI) {
-  try {
     const maskedUri = MONGO_URI.replace(/\/\/(.*?):(.*?)@/, '//$1:******@');
-    console.log("🔍 محاولة الاتصال بقاعدة البيانات بالرابط التالي:", maskedUri);
-  } catch (e) {
-    console.log("🔍 الرابط موجود لكن هناك مشكلة في صياغته.");
-  }
+    console.log("🔍 جاري الاتصال بالرابط التالي:", maskedUri);
 } else {
-  console.log("❌ تحذير: المتغير MONGO_URI فارغ أو غير موجود في Render!");
+    console.log("❌ خطأ: المتغير MONGO_URI غير موجود أو فارغ في Render!");
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_novent_key_2050';
