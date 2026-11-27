@@ -1,5 +1,5 @@
 // ============================================================
-// NOVENT Server V8 — SaaS (Phone Auth) + Ultimate WhatsApp
+// NOVENT Server V9 — Ultimate SaaS + WhatsApp + Admin Dashboard
 // ============================================================
 
 const express = require('express');
@@ -30,53 +30,29 @@ const PORT = process.env.PORT || 3000;
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(path.dirname(AUTH_DIR), 'novent_media');
 
-// ==========================================
-// 🛡️ محرك اتصال ذكي ومحمي 100%
-// ==========================================
+// 🛡️ محرك اتصال ذكي وقاعدة بيانات
 let MONGO_URI = process.env.MONGO_URI ? process.env.MONGO_URI.trim() : '';
-
-// إزالة أي علامات تنصيص قد تكون موجودة بالخطأ
 MONGO_URI = MONGO_URI.replace(/^["']|["']$/g, '');
-
 if (MONGO_URI && MONGO_URI.includes('://') && MONGO_URI.includes('@')) {
     try {
         const [protocol, rest] = MONGO_URI.split('://');
         const [credentials, host] = rest.split('@');
-        
         if (credentials.includes(':')) {
             const [user, ...passParts] = credentials.split(':');
-            const pass = passParts.join(':'); // لدعم كلمات المرور التي تحتوي على نقطتين
-            
-            // ترميز اسم المستخدم وكلمة المرور لضمان قبول أي رموز
-            const encodedUser = encodeURIComponent(user);
-            const encodedPass = encodeURIComponent(pass);
-            
-            MONGO_URI = `${protocol}://${encodedUser}:${encodedPass}@${host}`;
+            const pass = passParts.join(':');
+            MONGO_URI = `${protocol}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}`;
         }
-    } catch (e) {
-        console.log("⚠️ تحذير: هناك مشكلة في صياغة الرابط، سيتم استخدامه كما هو.");
-    }
+    } catch (e) {}
 }
-
-// إجبار إضافة authSource=admin إذا لم تكن موجودة
 if (MONGO_URI && MONGO_URI.startsWith('mongodb') && !MONGO_URI.includes('authSource=')) {
     MONGO_URI += (MONGO_URI.includes('?') ? '&' : '?') + 'authSource=admin';
 }
-
-// طباعة الرابط للتشخيص (بدون كلمة المرور)
-if (MONGO_URI) {
-    const maskedUri = MONGO_URI.replace(/\/\/(.*?):(.*?)@/, '//$1:******@');
-    console.log("🔍 جاري الاتصال بالرابط التالي:", maskedUri);
-} else {
-    console.log("❌ خطأ: المتغير MONGO_URI غير موجود أو فارغ في Render!");
-}
-
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_novent_key_2050';
 
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 // ==========================================
-// 1. قاعدة البيانات (MongoDB)
+// 1. قاعدة البيانات والنماذج
 // ==========================================
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected Successfully!'))
@@ -86,7 +62,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   phone: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, default: 'user' },
+  role: { type: String, default: 'user' }, // التطبيق يعتبر الجميع 'user' افتراضياً
   subscriptionEndDate: { type: Date, default: null },
   linkedPhone: { type: String, default: null },
   createdAt: { type: Date, default: Date.now }
@@ -94,7 +70,7 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 
 // ==========================================
-// 2. مسارات المصادقة (Auth Routes)
+// 2. مسارات المصادقة للتطبيق (Auth)
 // ==========================================
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -104,7 +80,9 @@ app.post('/api/auth/register', async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({ name, phone, password: hashedPassword });
+    
+    // جميع مستخدمي التطبيق يتم إنشاؤهم كـ 'user' عاديين
+    const user = await User.create({ name, phone, password: hashedPassword, role: 'user' });
 
     const token = jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ message: 'تم إنشاء الحساب بنجاح', token, user: { id: user._id, name: user.name, phone: user.phone, role: user.role } });
@@ -130,7 +108,98 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// 3. كود الواتساب (Baileys V7)
+// 3. الباب السري للمدير (Admin Login)
+// ==========================================
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // قراءة بيانات المدير من إعدادات Render (أو القيم الافتراضية)
+  const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+  const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+
+  if (username === ADMIN_USER && password === ADMIN_PASS) {
+    const token = jwt.sign({ role: 'admin', username: ADMIN_USER }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ success: true, token });
+  } else {
+    return res.status(401).json({ message: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
+  }
+});
+
+// ميدل وير لحماية مسارات الإدارة
+const isAdmin = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ message: 'غير مصرح' });
+  
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.role !== 'admin') return res.status(403).json({ message: 'صلاحيات المدير مطلوبة' });
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ message: 'توكن غير صالح' });
+  }
+};
+
+// ==========================================
+// 4. مسارات لوحة التحكم (Admin Routes)
+// ==========================================
+app.get('/api/admin/stats', isAdmin, async (req, res) => {
+  const totalUsers = await User.countDocuments();
+  const activeUsers = await User.countDocuments({ subscriptionEndDate: { $gt: new Date() } });
+  res.json({ totalUsers, activeUsers });
+});
+
+app.get('/api/admin/users', isAdmin, async (req, res) => {
+  const users = await User.find({}, '-password').sort({ createdAt: -1 });
+  res.json(users);
+});
+
+app.post('/api/admin/renew', isAdmin, async (req, res) => {
+  const { phone, days } = req.body;
+  const user = await User.findOne({ phone });
+  if (!user) return res.status(404).json({ message: 'المستخدم غير موجود' });
+
+  const currentEndDate = user.subscriptionEndDate && user.subscriptionEndDate > new Date() 
+    ? new Date(user.subscriptionEndDate) : new Date();
+  
+  currentEndDate.setDate(currentEndDate.getDate() + parseInt(days));
+  user.subscriptionEndDate = currentEndDate;
+  await user.save();
+
+  // إرسال إشعار واتساب تلقائي
+  if (sock && connectionStatus === 'connected') {
+    const jid = `${phone}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: `✅ *تم تجديد اشتراكك بنجاح*\nشكراً لك! تم إضافة ${days} يوماً.\nتاريخ الانتهاء الجديد: ${currentEndDate.toISOString().split('T')[0]}` }).catch(()=>{});
+  }
+  res.json({ message: 'تم التجديد بنجاح', newDate: currentEndDate });
+});
+
+app.post('/api/admin/reset-password', isAdmin, async (req, res) => {
+  const { phone, newPassword } = req.body;
+  const user = await User.findOne({ phone });
+  if (!user) return res.status(404).json({ message: 'المستخدم غير موجود' });
+
+  const salt = await bcrypt.genSalt(10);
+  user.password = await bcrypt.hash(newPassword, salt);
+  await user.save();
+  res.json({ message: 'تم تغيير كلمة المرور بنجاح' });
+});
+
+app.post('/api/admin/send-message', isAdmin, async (req, res) => {
+  const { phone, message } = req.body;
+  if (sock && connectionStatus === 'connected') {
+    try {
+      await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: message });
+      res.json({ success: true, message: 'تم إرسال الرسالة' });
+    } catch (e) { res.status(500).json({ success: false, message: 'فشل الإرسال' }); }
+  } else {
+    res.status(400).json({ message: 'الواتساب غير متصل' });
+  }
+});
+
+// ==========================================
+// 5. كود الواتساب (Baileys)
 // ==========================================
 let sock = null;
 let latestQR = null;
@@ -142,17 +211,15 @@ let isConnecting = false;
 const messageStore = new Map();     
 const alerts = [];                  
 const replyCooldown = new Map();    
-const MAX_ALERTS = 200;
-const MAX_MESSAGE_STORE = 5000;     
+const MAX_ALERTS = 100;
+const MAX_MESSAGE_STORE = 1000;     
 const REPLY_COOLDOWN_MS = 8000;     
 
 function storeKey(remoteJid, id) { return `${remoteJid}:${id}`; }
-
 function extractText(message) {
   if (!message) return null;
   return message.conversation || message.extendedTextMessage?.text || message.imageMessage?.caption || message.videoMessage?.caption || message.documentMessage?.caption || null;
 }
-
 function getSenderInfo(msg) {
   const remoteJid = msg.key.remoteJid || '';
   const isGroup = remoteJid.endsWith('@g.us');
@@ -161,20 +228,12 @@ function getSenderInfo(msg) {
   const name = msg.pushName || (isGroup ? `عضو (${phone})` : phone);
   return { jid: senderJid, phone, name, isGroup, remoteJid };
 }
-
-function addAlert(alert) {
-  alerts.unshift(alert);
-  if (alerts.length > MAX_ALERTS) alerts.pop();
-}
-
+function addAlert(alert) { alerts.unshift(alert); if (alerts.length > MAX_ALERTS) alerts.pop(); }
 function canReply(remoteJid) {
-  const now = Date.now();
-  const last = replyCooldown.get(remoteJid) || 0;
+  const now = Date.now(); const last = replyCooldown.get(remoteJid) || 0;
   if (now - last < REPLY_COOLDOWN_MS) return false;
-  replyCooldown.set(remoteJid, now);
-  return true;
+  replyCooldown.set(remoteJid, now); return true;
 }
-
 function formatDate(date) { return date.toISOString().split('T')[0]; }
 function formatTime(date) { return date.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', hour12: true }); }
 
@@ -184,7 +243,9 @@ async function connectToWhatsApp() {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+    
+    let version = [2, 3000, 1015901307];
+    try { const res = await fetchLatestBaileysVersion(); version = res.version; } catch (e) {}
 
     sock = makeWASocket({
       version,
@@ -192,7 +253,7 @@ async function connectToWhatsApp() {
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['NOVENT', 'Chrome', '1.0.0'],
-      generateHighQualityLinkPreview: true,
+      generateHighQualityLinkPreview: false, // لتقليل استهلاك الذاكرة
       syncFullHistory: false,
     });
 
@@ -200,7 +261,7 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
-      if (qr) { latestQR = qr; connectionStatus = 'awaiting_scan'; linkedPhone = null; }
+      if (qr) { latestQR = qr; connectionStatus = 'awaiting_scan'; linkedPhone = null; console.log('🔄 تم توليد كود QR جديد'); }
       if (connection === 'open') {
         connectionStatus = 'connected'; latestQR = null; reconnectAttempts = 0;
         linkedPhone = (sock.user?.id || '').split(':')[0].split('@')[0] || null;
@@ -212,7 +273,7 @@ async function connectToWhatsApp() {
         if (statusCode === DisconnectReason.loggedOut) { connectionStatus = 'needs_reauth'; isConnecting = false; }
         else {
           connectionStatus = 'disconnected';
-          const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts++), 60000);
+          const delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts++), 30000);
           setTimeout(() => { isConnecting = false; connectToWhatsApp().catch(console.error); }, delay);
         }
       }
@@ -323,7 +384,28 @@ async function connectToWhatsApp() {
 }
 
 // ==========================================
-// 4. مسارات الواتساب (Routes)
+// 6. التنبيهات التلقائية (كل 12 ساعة)
+// ==========================================
+setInterval(async () => {
+  if (connectionStatus !== 'connected') return;
+  const threeDaysFromNow = new Date();
+  threeDaysFromNow.setDate(threeDaysFromNow.getDate() + 3);
+  
+  const expiringUsers = await User.find({
+    subscriptionEndDate: { $gte: new Date(), $lte: threeDaysFromNow }
+  });
+
+  for (const user of expiringUsers) {
+    try {
+      const jid = `${user.phone}@s.whatsapp.net`;
+      const msg = `⚠️ *تنبيه هام* ⚠️\n\nعزيزي ${user.name}،\nاشتراكك في NOVENT سينتهي بتاريخ ${formatDate(user.subscriptionEndDate)}.\nيرجى التجديد لتجنب انقطاع الخدمة.`;
+      await sock.sendMessage(jid, { text: msg });
+    } catch (e) { }
+  }
+}, 12 * 60 * 60 * 1000);
+
+// ==========================================
+// 7. المسارات العامة (QR, Health)
 // ==========================================
 app.post('/api/logout', async (req, res) => {
   try {
@@ -333,9 +415,11 @@ app.post('/api/logout', async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.status(200).json({ ok: true, status: connectionStatus }));
+
 app.get('/qr', async (req, res) => {
   if (connectionStatus === 'connected') return res.send(`<html dir="rtl"><body style="text-align:center;padding:40px"><h2 style="color:green">✅ متصل</h2></body></html>`);
-  if (!latestQR) return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="3"></head><body style="text-align:center;padding:40px"><h2>⏳ جاري التهيئة...</h2></body></html>`);
+  if (!latestQR) return res.send(`<html dir="rtl"><head><meta http-equiv="refresh" content="2"></head><body style="text-align:center;padding:40px;background:#121A25;color:#00E5FF"><h2>⏳ جاري تهيئة الواتساب...</h2></body></html>`);
+  
   const qrImage = await QRCode.toDataURL(latestQR, { width: 320, margin: 2 });
   res.send(`
     <html dir="rtl">
