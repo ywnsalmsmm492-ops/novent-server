@@ -29,21 +29,46 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
 const MEDIA_DIR = process.env.MEDIA_DIR || path.join(path.dirname(AUTH_DIR), 'novent_media');
-const MONGO_URI = process.env.MONGO_URI || 'ضع_رابط_قاعدة_البيانات_هنا';
+
+// ==========================================
+// 🔍 فحص وتنظيف رابط قاعدة البيانات تلقائياً
+// ==========================================
+let rawMongoURI = process.env.MONGO_URI || '';
+
+// إزالة أي مسافات أو علامات تنصيص قد تكون سببت المشكلة
+let MONGO_URI = rawMongoURI.trim().replace(/^["']|["']$/g, '');
+
+// إجبار إضافة authSource=admin إذا لم تكن موجودة (مهم جداً للاتصال بـ Atlas)
+if (MONGO_URI && MONGO_URI !== 'ضع_رابط_قاعدة_البيانات_هنا' && !MONGO_URI.includes('authSource=')) {
+  MONGO_URI += (MONGO_URI.includes('?') ? '&' : '?') + 'authSource=admin';
+}
+
+// طباعة الرابط مع إخفاء كلمة المرور للتشخيص
+if (MONGO_URI) {
+  try {
+    const maskedUri = MONGO_URI.replace(/\/\/(.*?):(.*?)@/, '//$1:******@');
+    console.log("🔍 محاولة الاتصال بقاعدة البيانات بالرابط التالي:", maskedUri);
+  } catch (e) {
+    console.log("🔍 الرابط موجود لكن هناك مشكلة في صياغته.");
+  }
+} else {
+  console.log("❌ تحذير: المتغير MONGO_URI فارغ أو غير موجود في Render!");
+}
+
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_novent_key_2050';
 
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 // ==========================================
-// 1. قاعدة البيانات (MongoDB) - تم التحديث إلى phone
+// 1. قاعدة البيانات (MongoDB)
 // ==========================================
 mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ MongoDB Connected'))
-  .catch(err => console.error('❌ MongoDB Error:', err));
+  .then(() => console.log('✅ MongoDB Connected Successfully!'))
+  .catch(err => console.error('❌ MongoDB Error:', err.message));
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  phone: { type: String, required: true, unique: true }, // تم التغيير إلى phone
+  phone: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
   subscriptionEndDate: { type: Date, default: null },
@@ -53,7 +78,7 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 
 // ==========================================
-// 2. مسارات المصادقة (Auth Routes) - تم التحديث
+// 2. مسارات المصادقة (Auth Routes)
 // ==========================================
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -215,7 +240,6 @@ async function connectToWhatsApp() {
         const { remoteJid, id } = key;
         const stored = messageStore.get(storeKey(remoteJid, id));
 
-        // الحذف
         const isRevoke = upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE || (upd.message?.protocolMessage && upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
         if (isRevoke) {
           const senderName = stored?.senderName || 'غير معروف';
@@ -250,7 +274,6 @@ async function connectToWhatsApp() {
           messageStore.delete(storeKey(remoteJid, id));
         }
 
-        // التعديل
         let newText = null;
         if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) newText = extractText(upd.message.protocolMessage.editedMessage?.message);
         else if (upd.message?.editedMessage) newText = extractText(upd.message.editedMessage.message) || extractText(upd.message.editedMessage);
