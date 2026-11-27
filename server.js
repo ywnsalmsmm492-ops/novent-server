@@ -1,5 +1,5 @@
 // ============================================================
-// NOVENT Server V7 — SaaS + Ultimate WhatsApp Monitor (Media Support)
+// NOVENT Server V8 — SaaS (Phone Auth) + Ultimate WhatsApp
 // ============================================================
 
 const express = require('express');
@@ -35,7 +35,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_novent_key_2050';
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 // ==========================================
-// 1. قاعدة البيانات (MongoDB)
+// 1. قاعدة البيانات (MongoDB) - تم التحديث إلى phone
 // ==========================================
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected'))
@@ -43,7 +43,7 @@ mongoose.connect(MONGO_URI)
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
+  phone: { type: String, required: true, unique: true }, // تم التغيير إلى phone
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
   subscriptionEndDate: { type: Date, default: null },
@@ -53,20 +53,20 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 
 // ==========================================
-// 2. مسارات المصادقة (Auth Routes)
+// 2. مسارات المصادقة (Auth Routes) - تم التحديث
 // ==========================================
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-    const existingUser = await User.findOne({ email });
-    if (existingUser) return res.status(400).json({ message: 'البريد الإلكتروني مستخدم بالفعل' });
+    const { name, phone, password } = req.body;
+    const existingUser = await User.findOne({ phone });
+    if (existingUser) return res.status(400).json({ message: 'رقم الهاتف مستخدم بالفعل' });
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const user = await User.create({ name, email, password: hashedPassword });
+    const user = await User.create({ name, phone, password: hashedPassword });
 
     const token = jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ message: 'تم إنشاء الحساب بنجاح', token, user: { id: user._id, name: user.name, email: user.email, role: user.role } });
+    res.status(201).json({ message: 'تم إنشاء الحساب بنجاح', token, user: { id: user._id, name: user.name, phone: user.phone, role: user.role } });
   } catch (err) {
     res.status(500).json({ message: 'حدث خطأ', error: err.message });
   }
@@ -74,22 +74,22 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
+    const { phone, password } = req.body;
+    const user = await User.findOne({ phone });
+    if (!user) return res.status(400).json({ message: 'رقم الهاتف أو كلمة المرور غير صحيحة' });
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
+    if (!isMatch) return res.status(400).json({ message: 'رقم الهاتف أو كلمة المرور غير صحيحة' });
 
     const token = jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(200).json({ message: 'تم تسجيل الدخول بنجاح', token, user: { id: user._id, name: user.name, email: user.email, role: user.role, subscriptionEndDate: user.subscriptionEndDate } });
+    res.status(200).json({ message: 'تم تسجيل الدخول بنجاح', token, user: { id: user._id, name: user.name, phone: user.phone, role: user.role, subscriptionEndDate: user.subscriptionEndDate } });
   } catch (err) {
     res.status(500).json({ message: 'حدث خطأ', error: err.message });
   }
 });
 
 // ==========================================
-// 3. كود الواتساب (Baileys)
+// 3. كود الواتساب (Baileys V7)
 // ==========================================
 let sock = null;
 let latestQR = null;
@@ -223,7 +223,6 @@ async function connectToWhatsApp() {
           const senderJid = stored?.senderJid;
           const now = new Date();
 
-          // تحديد نوع الوسائط لعرضها في القالب
           let mediaLabel = stored?.text || '(النص الأصلي غير متوفر)';
           if (stored?.mediaType === 'image') mediaLabel = '📷 صورة (مرفقة بالأسفل)';
           else if (stored?.mediaType === 'video') mediaLabel = '🎥 فيديو (مرفق بالأسفل)';
