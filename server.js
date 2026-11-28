@@ -13,11 +13,12 @@ const fs = require('fs');
 const path = require('path');
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  initAuthCreds,
+  BufferJSON,
   proto,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
@@ -27,8 +28,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const AUTH_DIR = process.env.AUTH_DIR || './auth_info_baileys';
-const MEDIA_DIR = process.env.MEDIA_DIR || path.join(path.dirname(AUTH_DIR), 'novent_media');
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(__dirname, 'novent_media');
 
 // 🛡️ محرك اتصال ذكي وقاعدة بيانات
 let MONGO_URI = process.env.MONGO_URI ? process.env.MONGO_URI.trim() : '';
@@ -62,12 +62,69 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   phone: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, default: 'user' }, // التطبيق يعتبر الجميع 'user' افتراضياً
+  role: { type: String, default: 'user' },
   subscriptionEndDate: { type: Date, default: null },
   linkedPhone: { type: String, default: null },
   createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
+
+// 🛡️ نموذج لحفظ جلسة الواتساب في قاعدة البيانات (لحل مشكلة إعادة الربط)
+const sessionSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
+  data: { type: mongoose.Schema.Types.Mixed, required: true }
+});
+const Session = mongoose.model('Session', sessionSchema);
+
+async function useMongoAuthState() {
+  const writeData = async (data, id) => {
+    const json = JSON.stringify(data, BufferJSON.replacer);
+    await Session.findByIdAndUpdate(id, { data: JSON.parse(json) }, { upsert: true });
+  };
+  const readData = async (id) => {
+    try {
+      const session = await Session.findById(id);
+      if (!session || !session.data) return null;
+      return JSON.parse(JSON.stringify(session.data), BufferJSON.reviver);
+    } catch (error) {
+      return null;
+    }
+  };
+  const removeData = async (id) => { await Session.findByIdAndDelete(id); };
+
+  const creds = (await readData('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(ids.map(async id => {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }));
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              tasks.push(value ? writeData(value, key) : removeData(key));
+            }
+          }
+          await Promise.all(tasks);
+        }
+      }
+    },
+    saveCreds: () => writeData(creds, 'creds')
+  };
+}
 
 // ==========================================
 // 2. مسارات المصادقة للتطبيق (Auth)
@@ -80,8 +137,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    
-    // جميع مستخدمي التطبيق يتم إنشاؤهم كـ 'user' عاديين
     const user = await User.create({ name, phone, password: hashedPassword, role: 'user' });
 
     const token = jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
@@ -112,8 +167,6 @@ app.post('/api/auth/login', async (req, res) => {
 // ==========================================
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body;
-  
-  // قراءة بيانات المدير من إعدادات Render (أو القيم الافتراضية)
   const ADMIN_USER = process.env.ADMIN_USER || 'admin';
   const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 
@@ -125,11 +178,9 @@ app.post('/api/admin/login', (req, res) => {
   }
 });
 
-// ميدل وير لحماية مسارات الإدارة
 const isAdmin = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ message: 'غير مصرح' });
-  
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
@@ -162,12 +213,10 @@ app.post('/api/admin/renew', isAdmin, async (req, res) => {
 
   const currentEndDate = user.subscriptionEndDate && user.subscriptionEndDate > new Date() 
     ? new Date(user.subscriptionEndDate) : new Date();
-  
   currentEndDate.setDate(currentEndDate.getDate() + parseInt(days));
   user.subscriptionEndDate = currentEndDate;
   await user.save();
 
-  // إرسال إشعار واتساب تلقائي
   if (sock && connectionStatus === 'connected') {
     const jid = `${phone}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: `✅ *تم تجديد اشتراكك بنجاح*\nشكراً لك! تم إضافة ${days} يوماً.\nتاريخ الانتهاء الجديد: ${currentEndDate.toISOString().split('T')[0]}` }).catch(()=>{});
@@ -242,7 +291,8 @@ async function connectToWhatsApp() {
   isConnecting = true;
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    // استخدام قاعدة البيانات لحفظ الجلسة بدلاً من الملفات
+    const { state, saveCreds } = await useMongoAuthState();
     
     let version = [2, 3000, 1015901307];
     try { const res = await fetchLatestBaileysVersion(); version = res.version; } catch (e) {}
@@ -253,7 +303,7 @@ async function connectToWhatsApp() {
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['NOVENT', 'Chrome', '1.0.0'],
-      generateHighQualityLinkPreview: false, // لتقليل استهلاك الذاكرة
+      generateHighQualityLinkPreview: false,
       syncFullHistory: false,
     });
 
@@ -280,9 +330,62 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      if (type !== 'notify' && type !== 'append') return;
       for (const msg of messages) {
-        if (msg.key.fromMe || !msg.message || msg.message.protocolMessage) continue;
+        if (msg.key.fromMe || !msg.message) continue;
+
+        // 🛠️ التقاط التعديلات والحذف التي تأتي عبر upsert
+        if (msg.message.protocolMessage) {
+          const protocolMsg = msg.message.protocolMessage;
+          const targetId = protocolMsg.key.id;
+          const targetJid = protocolMsg.key.remoteJid;
+          const stored = messageStore.get(storeKey(targetJid, targetId));
+
+          if (protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+            const newText = extractText(protocolMsg.editedMessage);
+            if (newText) {
+              const senderName = stored?.senderName || msg.pushName || 'غير معروف';
+              const senderPhone = stored?.senderPhone || (targetJid || '').split('@')[0];
+              const senderJid = stored?.senderJid || targetJid;
+              const oldText = stored?.text || '(الرسالة الأصلية غير متوفرة)';
+              const now = new Date();
+
+              addAlert({ id: `${targetId}_edit_${Date.now()}`, type: 'EDITED', sender: `${senderName} • ${senderPhone}`, messageText: `من: ${oldText}\nإلى: ${newText}`, timeText: formatTime(now), remoteJid: targetJid, timestamp: Date.now() });
+
+              if (canReply(targetJid)) {
+                try {
+                  const replyText = `🚫 *تم تعديل رسالة من المحادثة*\n\n📱 *المرسل:* ${senderPhone}\n👤 *الاسم:* ${senderName}\n✉ *الرسالة قبل التعديل:* ${oldText}\n📝 *الرسالة الجديدة:* ${newText}\n🕒 *تاريخ الرسالة:* ${formatDate(now)} *الساعة:* ${formatTime(now)}\n\n⚠ *لا يمكنك تعديل الرسائل بعد إرسالها*`;
+                  await sock.sendMessage(targetJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
+                } catch (e) { console.log('Error replying to edit in upsert:', e.message); }
+              }
+              if (stored) { stored.text = newText; messageStore.set(storeKey(targetJid, targetId), stored); }
+            }
+            continue;
+          }
+
+          if (protocolMsg.type === proto.Message.ProtocolMessage.Type.REVOKE) {
+             const senderName = stored?.senderName || 'غير معروف';
+             const senderPhone = stored?.senderPhone || '';
+             const senderJid = stored?.senderJid;
+             const now = new Date();
+             let mediaLabel = stored?.text || '(النص الأصلي غير متوفر)';
+
+             addAlert({ id: targetId, type: 'DELETED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`, messageText: stored?.text || mediaLabel, timeText: formatTime(now), remoteJid: targetJid, timestamp: Date.now() });
+
+             if (canReply(targetJid)) {
+               try {
+                 const replyText = `❌ *تم حذف رسالة من المحادثة*\n\n📱 *المرسل:* ${senderPhone || 'غير معروف'}\n👤 *الاسم:* ${senderName}\n✉ *الرسالة قبل الحذف:* ${mediaLabel}\n🕒 *تاريخ الرسالة:*  ${formatDate(now)} *الساعة:* ${formatTime(now)}\n\n⚠ *يرجى عدم حذف أي رسالة*`;
+                 await sock.sendMessage(targetJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
+               } catch (e) { }
+             }
+             if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) fs.unlinkSync(stored.mediaPath);
+             messageStore.delete(storeKey(targetJid, targetId));
+             continue;
+          }
+          continue; 
+        }
+
+        // معالجة الرسائل العادية
         const text = extractText(msg.message);
         const isImage = !!msg.message.imageMessage; const isVideo = !!msg.message.videoMessage; const isAudio = !!msg.message.audioMessage; const isDocument = !!msg.message.documentMessage; const isSticker = !!msg.message.stickerMessage;
         if (!text && !isImage && !isVideo && !isAudio && !isDocument && !isSticker) continue;
@@ -315,10 +418,8 @@ async function connectToWhatsApp() {
         const { key, update: upd } = update;
         if (!key || !upd) continue;
         
-        // استخراج المعرف الأصلي للرسالة لضمان العثور عليها في التعديل والحذف
         const originalId = upd.message?.protocolMessage?.key?.id || key.id;
         const remoteJid = upd.message?.protocolMessage?.key?.remoteJid || key.remoteJid;
-        
         const stored = messageStore.get(storeKey(remoteJid, originalId));
 
         const isRevoke = upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE || (upd.message?.protocolMessage && upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
@@ -353,17 +454,15 @@ async function connectToWhatsApp() {
           }
           if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) fs.unlinkSync(stored.mediaPath);
           messageStore.delete(storeKey(remoteJid, originalId));
-          continue; // ننتقل للرسالة التالية بعد معالجة الحذف
+          continue;
         }
 
-        // 🛠️ إصلاح استخراج النص المعدل (الخطأ كان هنا في الكود السابق)
+        // 🛠️ التقاط التعديلات التي تأتي عبر التحديث (Update)
         let newText = null;
         if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
           newText = extractText(upd.message.protocolMessage.editedMessage); 
         } else if (upd.message?.editedMessage) {
           newText = extractText(upd.message.editedMessage.message) || extractText(upd.message.editedMessage);
-        } else if (upd.message?.protocolMessage?.editedMessage) {
-          newText = extractText(upd.message.protocolMessage.editedMessage);
         }
 
         if (newText) {
@@ -389,6 +488,7 @@ async function connectToWhatsApp() {
     isConnecting = false;
   } catch (err) {
     isConnecting = false;
+    console.error('WhatsApp Connection Error:', err);
     setTimeout(() => connectToWhatsApp().catch(console.error), 5000);
   }
 }
@@ -419,7 +519,13 @@ setInterval(async () => {
 // ==========================================
 app.post('/api/logout', async (req, res) => {
   try {
-    if (sock && connectionStatus === 'connected') { await sock.logout(); connectionStatus = 'disconnected'; linkedPhone = null; res.json({ success: true, message: 'تم فصل الجهاز' }); }
+    if (sock && connectionStatus === 'connected') { 
+      await sock.logout(); 
+      connectionStatus = 'disconnected'; 
+      linkedPhone = null; 
+      await Session.deleteMany({}); // مسح الجلسة من قاعدة البيانات
+      res.json({ success: true, message: 'تم فصل الجهاز' }); 
+    }
     else res.json({ success: false, message: 'الجهاز غير متصل بالفعل' });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
