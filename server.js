@@ -314,8 +314,12 @@ async function connectToWhatsApp() {
       for (const update of updates) {
         const { key, update: upd } = update;
         if (!key || !upd) continue;
-        const { remoteJid, id } = key;
-        const stored = messageStore.get(storeKey(remoteJid, id));
+        
+        // استخراج المعرف الأصلي للرسالة لضمان العثور عليها في التعديل والحذف
+        const originalId = upd.message?.protocolMessage?.key?.id || key.id;
+        const remoteJid = upd.message?.protocolMessage?.key?.remoteJid || key.remoteJid;
+        
+        const stored = messageStore.get(storeKey(remoteJid, originalId));
 
         const isRevoke = upd.messageStubType === proto.WebMessageInfo.StubType.REVOKE || (upd.message?.protocolMessage && upd.message.protocolMessage.type === proto.Message.ProtocolMessage.Type.REVOKE);
         if (isRevoke) {
@@ -331,7 +335,7 @@ async function connectToWhatsApp() {
           else if (stored?.mediaType === 'document') mediaLabel = '📁 ملف (مرفق بالأسفل)';
           else if (stored?.mediaType === 'sticker') mediaLabel = '🖼️ ملصق';
 
-          addAlert({ id, type: 'DELETED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`, messageText: stored?.text || mediaLabel, timeText: formatTime(now), remoteJid, timestamp: Date.now() });
+          addAlert({ id: originalId, type: 'DELETED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`, messageText: stored?.text || mediaLabel, timeText: formatTime(now), remoteJid, timestamp: Date.now() });
 
           if (canReply(remoteJid)) {
             try {
@@ -345,16 +349,22 @@ async function connectToWhatsApp() {
               } else {
                 await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
               }
-            } catch (e) { }
+            } catch (e) { console.log('Error replying to delete:', e.message); }
           }
           if (stored?.mediaPath && fs.existsSync(stored.mediaPath)) fs.unlinkSync(stored.mediaPath);
-          messageStore.delete(storeKey(remoteJid, id));
+          messageStore.delete(storeKey(remoteJid, originalId));
+          continue; // ننتقل للرسالة التالية بعد معالجة الحذف
         }
 
+        // 🛠️ إصلاح استخراج النص المعدل (الخطأ كان هنا في الكود السابق)
         let newText = null;
-        if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) newText = extractText(upd.message.protocolMessage.editedMessage?.message);
-        else if (upd.message?.editedMessage) newText = extractText(upd.message.editedMessage.message) || extractText(upd.message.editedMessage);
-        else if (upd.message?.protocolMessage?.editedMessage) newText = extractText(upd.message.protocolMessage.editedMessage.message);
+        if (upd.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+          newText = extractText(upd.message.protocolMessage.editedMessage); 
+        } else if (upd.message?.editedMessage) {
+          newText = extractText(upd.message.editedMessage.message) || extractText(upd.message.editedMessage);
+        } else if (upd.message?.protocolMessage?.editedMessage) {
+          newText = extractText(upd.message.protocolMessage.editedMessage);
+        }
 
         if (newText) {
           const senderName = stored?.senderName || 'غير معروف';
@@ -363,15 +373,15 @@ async function connectToWhatsApp() {
           const oldText = stored?.text || '(الرسالة الأصلية غير متوفرة)';
           const now = new Date();
 
-          addAlert({ id: `${id}_edit_${Date.now()}`, type: 'EDITED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`, messageText: `من: ${oldText}\nإلى: ${newText}`, timeText: formatTime(now), remoteJid, timestamp: Date.now() });
+          addAlert({ id: `${originalId}_edit_${Date.now()}`, type: 'EDITED', sender: `${senderName}${senderPhone ? ` • ${senderPhone}` : ''}`, messageText: `من: ${oldText}\nإلى: ${newText}`, timeText: formatTime(now), remoteJid, timestamp: Date.now() });
 
           if (canReply(remoteJid)) {
             try {
-              const replyText = `🚫 *تم تعديل رسالة من المحادثة*\n\n📱 *المرسل:* ${senderPhone || 'غير معروف'}\n👤 *الاسم:* ${senderName}\n✉ *الرسالة قبل التعديل:* ${oldText}\n🕒 *تاريخ الرسالة:*  ${formatDate(now)} *الساعة:* ${formatTime(now)}\n\n⚠ *لا يمكنك تعديل الرسائل بعد إرسالها*`;
+              const replyText = `🚫 *تم تعديل رسالة من المحادثة*\n\n📱 *المرسل:* ${senderPhone || 'غير معروف'}\n👤 *الاسم:* ${senderName}\n✉ *الرسالة قبل التعديل:* ${oldText}\n📝 *الرسالة الجديدة:* ${newText}\n🕒 *تاريخ الرسالة:*  ${formatDate(now)} *الساعة:* ${formatTime(now)}\n\n⚠ *لا يمكنك تعديل الرسائل بعد إرسالها*`;
               await sock.sendMessage(remoteJid, { text: replyText, mentions: senderJid ? [senderJid] : [] });
-            } catch (e) { }
+            } catch (e) { console.log('Error replying to edit:', e.message); }
           }
-          if (stored) { stored.text = newText; messageStore.set(storeKey(remoteJid, id), stored); }
+          if (stored) { stored.text = newText; messageStore.set(storeKey(remoteJid, originalId), stored); }
         }
       }
     });
